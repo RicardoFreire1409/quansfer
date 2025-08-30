@@ -1,250 +1,321 @@
+// lib/pages/receiver_page.dart
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
-import 'package:file_picker/file_picker.dart';
-import 'package:file_saver/file_saver.dart';
+
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
-import 'package:flutter/foundation.dart' show kIsWeb;
-import '../services/crypto_service.dart';
-import 'dart:io';    
+import 'package:file_selector/file_selector.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
+
+import '../widgets/primary_button.dart';
+import '../widgets/info_tile.dart';
+import '../app_state.dart';
+
 class ReceiverPage extends StatefulWidget {
-  final String baseUrl;
-  const ReceiverPage({super.key, required this.baseUrl});
+  final AppState appState;
+  const ReceiverPage({super.key, required this.appState});
 
   @override
   State<ReceiverPage> createState() => _ReceiverPageState();
 }
 
 class _ReceiverPageState extends State<ReceiverPage> {
-  final _crypto = CryptoService();
-  Uint8List? _encBytes;
-  String? _encName;
-
-  final _ivController = TextEditingController();
-  final _keyHexController = TextEditingController();
+  final _transferIdController = TextEditingController();
   bool _busy = false;
+  String? _filename; // nombre ORIGINAL (con extensión) desde el backend
+  String get _baseUrl => widget.appState.baseUrl;
 
-  Future<void> _pickEncFile() async {
-  try {
-    final res = await FilePicker.platform.pickFiles(
-      type: FileType.any,      // 👈 abre el picker en todos los dispositivos
-      allowMultiple: false,
-      withData: true,          // intenta traer bytes en memoria
+  @override
+  void dispose() {
+    _transferIdController.dispose();
+    super.dispose();
+  }
+
+  // -------------------- Helpers --------------------
+  void _toast(String msg, {bool isError = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        backgroundColor: isError ? Colors.red.shade700 : null,
+        duration: const Duration(seconds: 2),
+      ),
     );
+  }
 
-    if (res == null || res.files.isEmpty) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Selección cancelada')),
-        );
+  Future<http.Response> _get(String path) {
+    return http.get(Uri.parse('$_baseUrl$path')).timeout(const Duration(seconds: 60));
+  }
+
+  /// Garantiza que _filename (del backend) esté cargado para el id actual.
+  Future<void> _ensureMeta(String id) async {
+    if (id.isEmpty) return;
+    if (_filename != null && _filename!.isNotEmpty) return;
+    try {
+      final r = await _get('/transfer/$id');
+      if (r.statusCode == 200) {
+        final data = jsonDecode(r.body) as Map<String, dynamic>;
+        final fname = (data['filename_original'] as String?)?.trim();
+        if (fname != null && fname.isNotEmpty && mounted) {
+          setState(() => _filename = fname);
+        }
       }
-      return;
+    } catch (_) {
+      // Silencioso; no bloqueamos el flujo si falla la metadata.
+    }
+  }
+
+  /// Extrae filename de Content-Disposition.
+  String? _filenameFromHeaders(Map<String, String> headers) {
+    final cd = headers.entries
+        .firstWhere(
+          (e) => e.key.toLowerCase() == 'content-disposition',
+          orElse: () => const MapEntry('', ''),
+        )
+        .value;
+    if (cd.isEmpty) return null;
+
+    // Raw triple quotes (sin escapes) para Dart.
+    final fnStar = RegExp(
+      r'''filename\*\s*=\s*[^'"]*''([^;]+)''',
+      caseSensitive: false,
+    ).firstMatch(cd);
+    if (fnStar != null) {
+      try {
+        return Uri.decodeComponent(fnStar.group(1)!.trim());
+      } catch (_) {}
     }
 
-    final file = res.files.first;
+    final fn = RegExp(r'filename\s*=\s*"([^"]+)"', caseSensitive: false).firstMatch(cd);
+    if (fn != null) return fn.group(1)!.trim();
 
-    // Validamos extensión .enc (case-insensitive)
-    final name = file.name;
-    final isEnc = name.toLowerCase().endsWith('.enc');
-    if (!isEnc) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Selecciona un archivo .enc (elegiste: $name)')),
-        );
-      }
+    final fn2 = RegExp(r'filename\s*=\s*([^;]+)', caseSensitive: false).firstMatch(cd);
+    if (fn2 != null) return fn2.group(1)!.trim();
+
+    return null;
+  }
+
+  /// Guardar bytes mostrando “Guardar en…” (SAF/UIDocumentPicker) en TODAS las plataformas soportadas.
+  /// Requiere file_selector (+ file_selector_android / file_selector_ios).
+  Future<void> _saveWithPicker(Uint8List bytes, String suggestedName) async {
+  try {
+    // 1) INTENTA usar el diálogo nativo (SAF/UIDocumentPicker)
+    final location = await getSaveLocation(
+      suggestedName: suggestedName,
+      acceptedTypeGroups: const [XTypeGroup(label: 'All', extensions: ['*'])],
+    );
+    if (location == null) {
+      _toast('Guardado cancelado');
       return;
     }
+    final xf = XFile.fromData(bytes, name: suggestedName, mimeType: 'application/octet-stream');
+    await xf.saveTo(location.path);
+    _toast('Guardado correctamente');
+    return;
+  } on UnimplementedError {
+    // 2) FALLBACK para dispositivos sin proveedor SAF (p.ej., algunos MIUI)
+    try {
+      // (Opcional) para Android < 10 podrías pedir WRITE_EXTERNAL_STORAGE:
+      // await Permission.storage.request();
 
-    // Obtenemos bytes: si withData falló, leemos por path (solo no-web)
-    Uint8List bytes;
-    if (file.bytes != null) {
-      bytes = file.bytes!;
-    } else if (!kIsWeb && file.path != null) {
-      bytes = await File(file.path!).readAsBytes();
-    } else {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('No se pudieron obtener bytes del .enc')),
-        );
+      // a) Guarda en directorio de la app (accesible vía "Archivos" > Android > data en algunos SO)
+      final dir = await getExternalStorageDirectory(); // /Android/data/<pkg>/files en Android
+      final fallbackDir = Directory('${dir!.path}/quansfer');
+      if (!await fallbackDir.exists()) {
+        await fallbackDir.create(recursive: true);
       }
+      final filePath = '${fallbackDir.path}/$suggestedName';
+      final f = File(filePath);
+      await f.writeAsBytes(bytes);
+
+      // b) Ofrece COMPARTIR para que el usuario lo envíe a "Descargas/Drive/Files"
+      await Share.shareXFiles([XFile(f.path)], text: 'Saved via Quansfer');
+
+      _toast('Guardado en carpeta de la app y compartido');
       return;
-    }
-
-    setState(() {
-      _encBytes = bytes;
-      _encName  = name;
-    });
-
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Seleccionado: $_encName')),
-      );
+    } catch (e2) {
+      _toast('Guardado no soportado en esta plataforma y fallback falló: $e2', isError: true);
     }
   } catch (e) {
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error al seleccionar: $e')),
-      );
-    }
+    _toast('Error al guardar: $e', isError: true);
   }
 }
 
-  Future<void> _fetchKeyFromServer() async {
-    setState(() => _busy = true);
+
+  String _decideEncryptedName(String? headerName) {
+    if (headerName != null && headerName.isNotEmpty) return headerName;
+    if (_filename != null && _filename!.isNotEmpty) return '${_filename!}.enc';
+    return 'file.enc';
+  }
+
+  String _decideDecryptedName(String? headerName) {
+    if (_filename != null && _filename!.isNotEmpty) return _filename!;
+    if (headerName != null && headerName.isNotEmpty) return headerName;
+    return 'output.data';
+  }
+
+  // -------------------- API calls --------------------
+  Future<void> _loadMeta() async {
+    final id = _transferIdController.text.trim();
+    if (id.isEmpty) return;
     try {
-      final r = await http.get(Uri.parse('${widget.baseUrl}/qkd/key'));
+      final r = await _get('/transfer/$id');
       if (r.statusCode == 200) {
         final data = jsonDecode(r.body) as Map<String, dynamic>;
-        _keyHexController.text = data['key_hex'] as String;
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Clave (BB84) obtenida del servidor.')));
-        }
+        setState(() => _filename = (data['filename_original'] as String?)?.trim());
       } else {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error clave: ${r.statusCode}')));
-        }
+        _toast('Transfer not found (${r.statusCode})', isError: true);
       }
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
-      }
-    } finally {
-      if (mounted) setState(() => _busy = false);
+      _toast('Network error: $e', isError: true);
     }
   }
 
-  Future<void> _decryptLocally() async {
-    if (_encBytes == null || _ivController.text.isEmpty || _keyHexController.text.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Falta archivo .enc, IV o clave.')));
-      return;
-    }
+  Future<void> _downloadEncrypted() async {
+    final id = _transferIdController.text.trim();
+    if (id.isEmpty) return;
+
     setState(() => _busy = true);
     try {
-      final iv = base64Decode(_ivController.text.trim());
-      final keyHex = _keyHexController.text.trim();
-      final keyBytes = <int>[];
-      for (var i = 0; i < keyHex.length; i += 2) {
-        keyBytes.add(int.parse(keyHex.substring(i, i + 2), radix: 16));
+      await _ensureMeta(id);
+
+      final r = await _get('/download/$id');
+      if (r.statusCode != 200) {
+        _toast('Download error: ${r.statusCode} – ${r.body}', isError: true);
+        return;
       }
-      final plain = _crypto.decryptBytes(_encBytes!, Uint8List.fromList(keyBytes), Uint8List.fromList(iv));
 
-      // Nombre de salida
-      var outName = _encName ?? 'output.enc';
-      if (outName.endsWith('.enc')) outName = outName.substring(0, outName.length - 4);
+      final headerName = _filenameFromHeaders(r.headers);
+      final name = _decideEncryptedName(headerName);
 
-      // Guardar archivo
-      await FileSaver.instance.saveFile(
-        name: outName,
-        bytes: plain,
-        mimeType: MimeType.other,
-      );
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Archivo guardado: $outName')));
-      }
+      await _saveWithPicker(Uint8List.fromList(r.bodyBytes), name);
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Fallo al descifrar: $e')));
-      }
+      _toast('Download error: $e', isError: true);
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
 
   Future<void> _decryptOnServer() async {
-    if (_encBytes == null || _ivController.text.isEmpty || _keyHexController.text.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Falta archivo .enc, IV o clave.')));
-      return;
-    }
+    final id = _transferIdController.text.trim();
+    if (id.isEmpty) return;
+
     setState(() => _busy = true);
     try {
-      final req = http.MultipartRequest('POST', Uri.parse('${widget.baseUrl}/decrypt'));
-      req.fields['iv_b64'] = _ivController.text.trim();
-      req.fields['key_hex'] = _keyHexController.text.trim();
-      if (_encName != null) req.fields['original_name'] = _encName!.endsWith('.enc') ? _encName!.substring(0, _encName!.length - 4) : _encName!;
-      req.files.add(http.MultipartFile.fromBytes('file', _encBytes!, filename: _encName ?? 'file.enc'));
+      await _ensureMeta(id);
 
-      final resp = await req.send();
-      if (resp.statusCode == 200) {
-        final bytes = await resp.stream.toBytes();
-        var outName = _encName ?? 'output.enc';
-        if (outName.endsWith('.enc')) outName = outName.substring(0, outName.length - 4);
-        await FileSaver.instance.saveFile(name: outName, bytes: bytes, mimeType: MimeType.other);
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Descifrado en servidor y guardado: $outName')));
-        }
-      } else {
-        final body = await resp.stream.bytesToString();
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Servidor respondió ${resp.statusCode}: $body')));
-        }
+      final r = await _get('/decrypt_by_id/$id');
+      if (r.statusCode != 200) {
+        _toast('Decrypt error: ${r.statusCode} – ${r.body}', isError: true);
+        return;
       }
+      final headerName = _filenameFromHeaders(r.headers);
+      final outName = _decideDecryptedName(headerName);
+
+      await _saveWithPicker(Uint8List.fromList(r.bodyBytes), outName);
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
-      }
+      _toast('Decrypt error: $e', isError: true);
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
 
+  Future<void> _decryptAndShare() async {
+    final id = _transferIdController.text.trim();
+    if (id.isEmpty) return;
+
+    setState(() => _busy = true);
+    try {
+      await _ensureMeta(id);
+
+      final r = await _get('/decrypt_by_id/$id');
+      if (r.statusCode != 200) {
+        _toast('Decrypt/Share error: ${r.statusCode} – ${r.body}', isError: true);
+        return;
+      }
+      final headerName = _filenameFromHeaders(r.headers);
+      final outName = _decideDecryptedName(headerName);
+
+      final tmp = await getTemporaryDirectory();
+      final f = File('${tmp.path}/$outName');
+      await f.writeAsBytes(r.bodyBytes);
+
+      await Share.shareXFiles(
+        [XFile(f.path)],
+        text: 'Decrypted via Quansfer',
+      );
+    } catch (e) {
+      _toast('Decrypt/Share error: $e', isError: true);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  // -------------------- UI --------------------
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Receptor (Descifrar)')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: ListView(
-          children: [
-            FilledButton.icon(
-              onPressed: _pickEncFile,
-              icon: const Icon(Icons.attach_file),
-              label: Text(_encName == null ? 'Seleccionar archivo .enc' : 'Archivo: $_encName'),
+      appBar: AppBar(title: const Text('Receiver')),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 24),
+        children: [
+          Text(
+            'Use your Transfer ID',
+            style: Theme.of(context)
+                .textTheme
+                .titleMedium!
+                .copyWith(fontWeight: FontWeight.w800),
+          ),
+          const SizedBox(height: 12),
+
+          TextField(
+            controller: _transferIdController,
+            textInputAction: TextInputAction.done,
+            onSubmitted: (_) => _loadMeta(),
+            decoration: const InputDecoration(
+              labelText: 'Transfer ID',
+              hintText: 'Paste or type your ID',
             ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _ivController,
-              decoration: const InputDecoration(
-                labelText: 'IV (Base64)',
-                hintText: 'Ej: 3ux1sLk... (16 bytes base64)',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _keyHexController,
-              decoration: const InputDecoration(
-                labelText: 'Clave (Hex)',
-                hintText: '32 hex chars para AES-128',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                OutlinedButton.icon(
-                  onPressed: _fetchKeyFromServer,
-                  icon: const Icon(Icons.key),
-                  label: const Text('Pedir clave al servidor'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            FilledButton.icon(
-              onPressed: _busy ? null : _decryptLocally,
-              icon: const Icon(Icons.lock_open),
-              label: const Text('Descifrar LOCAL y guardar'),
-            ),
-            const SizedBox(height: 8),
-            FilledButton.icon(
-              onPressed: _busy ? null : _decryptOnServer,
-              icon: const Icon(Icons.cloud_download),
-              label: const Text('Descifrar en SERVIDOR y guardar'),
-            ),
-            const SizedBox(height: 16),
-            if (_busy) const LinearProgressIndicator(),
-          ],
-        ),
+          ),
+          const SizedBox(height: 12),
+
+          InfoTile(
+            icon: Icons.insert_drive_file,
+            title: _filename ?? 'No file metadata',
+            subtitle: 'Tap buttons below to download or decrypt.',
+          ),
+          const SizedBox(height: 16),
+
+          PrimaryButton(
+            onPressed: _busy ? null : _downloadEncrypted,
+            icon: Icons.download,
+            label: 'Download encrypted file',
+            loading: _busy,
+          ),
+          const SizedBox(height: 10),
+          PrimaryButton(
+            onPressed: _busy ? null : _decryptOnServer,
+            icon: Icons.lock_open,
+            label: 'Decrypt on server',
+            loading: _busy,
+          ),
+          const SizedBox(height: 10),
+          PrimaryButton(
+            onPressed: _busy ? null : _decryptAndShare,
+            icon: Icons.ios_share,
+            label: 'Decrypt & share',
+            loading: _busy,
+          ),
+
+          const SizedBox(height: 8),
+          TextButton.icon(
+            onPressed: _loadMeta,
+            icon: const Icon(Icons.refresh),
+            label: const Text('Refresh metadata'),
+          ),
+        ],
       ),
     );
   }

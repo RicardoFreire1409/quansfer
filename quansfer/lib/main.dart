@@ -1,20 +1,32 @@
 import 'package:flutter/material.dart';
-import 'pages/home_page.dart';
+import 'theme.dart';
+import 'pages/splash_page.dart';
+import 'app_state.dart';
 
-void main() {
-  runApp(const QuansferApp());
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final appState = AppState();
+  await appState.init();
+  runApp(QuansferApp(appState: appState));
 }
 
 class QuansferApp extends StatelessWidget {
-  const QuansferApp({super.key});
+  final AppState appState;
+  const QuansferApp({super.key, required this.appState});
 
   @override
   Widget build(BuildContext context) {
-    const baseUrl = 'http://192.168.100.149:8000'; // IP DE MI PC
-    return MaterialApp(
-      title: 'quansfer',
-      theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo),
-      home: const HomePage(baseUrl: baseUrl),
+    // Rebuilds mínimos cuando cambie baseUrl
+    return AnimatedBuilder(
+      animation: appState,
+      builder: (_, __) {
+        return MaterialApp(
+          title: 'Quansfer',
+          debugShowCheckedModeBanner: false,
+          theme: theme,
+          home: SplashPage(appState: appState), // pasa el estado
+        );
+      },
     );
   }
 }

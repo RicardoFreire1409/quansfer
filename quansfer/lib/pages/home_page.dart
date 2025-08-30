@@ -1,200 +1,219 @@
+import 'dart:convert';
 import 'dart:typed_data';
-import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
-import 'receiver_page.dart';   // ✅
-import 'dart:io';
-import '../services/key_service.dart';
+
+import '../widgets/brand_logo.dart';
+import '../widgets/primary_button.dart';
+import '../widgets/info_tile.dart';
 import '../services/crypto_service.dart';
-
+import 'receiver_page.dart';
+import '../app_state.dart';
+import 'settings_page.dart';
 class HomePage extends StatefulWidget {
-  final String baseUrl;
-  const HomePage({super.key, required this.baseUrl});
-
+  final AppState appState;
+  const HomePage({super.key, required this.appState});
+  
   @override
   State<HomePage> createState() => _HomePageState();
 }
 
 class _HomePageState extends State<HomePage> {
+    String get _baseUrl => widget.appState.baseUrl;
+
   Uint8List? _fileBytes;
   String? _fileName;
-  List<int>? _bb84Key;
-  late final KeyService _keyService;
-  final _crypto = CryptoService();
+  String? _keyHex;
   bool _busy = false;
 
-  @override
-  void initState() {
-    super.initState();
-    _keyService = KeyService(widget.baseUrl);
-  }
+  final _crypto = CryptoService();
 
-  Future<void> _getKey() async {
+  Future<void> _getBB84Key() async {
     setState(() => _busy = true);
     try {
-      final k = await _keyService.fetchSharedKey();
-      setState(() => _bb84Key = k);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Clave BB84 obtenida.')),
-        );
+        final r = await http.get(Uri.parse('$_baseUrl/qkd/key'));      if (r.statusCode == 200) {
+        final data = jsonDecode(r.body) as Map<String, dynamic>;
+        setState(() => _keyHex = data['key_hex'] as String);
+        _toast('BB84 key ready.');
+      } else {
+        _toast('Server error: ${r.statusCode}', isError: true);
       }
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error clave: $e')),
-        );
-      }
+      _toast('Network error: $e', isError: true);
     } finally {
-      if (mounted) setState(() => _busy = false);
+      setState(() => _busy = false);
     }
   }
 
   Future<void> _pickFile() async {
-  try {
-    final res = await FilePicker.platform.pickFiles(
-      type: FileType.any,      // fuerza cualquier tipo
-      allowMultiple: false,
-      withData: true,          // importante para tener bytes en memoria
-    );
-
-    if (res == null || res.files.isEmpty) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Selección cancelada o vacía')),
-        );
-      }
-      return;
-    }
-
-    final file = res.files.first;
-    if (file.bytes == null) {
-      // En algunos dispositivos, withData puede no traer bytes.
-      // Podemos leer por path si existe:
-      if (file.path == null) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('No se pudieron obtener bytes del archivo.')),
-          );
-        }
-        return;
-      }
-      // Lee desde path como fallback:
-      final bytes = await File(file.path!).readAsBytes();
+    final res = await FilePicker.platform.pickFiles(withData: true);
+    if (!mounted) return;
+    if (res != null && res.files.isNotEmpty) {
       setState(() {
-        _fileBytes = bytes;
-        _fileName  = file.name;
+        _fileBytes = res.files.first.bytes!;
+        _fileName  = res.files.first.name;
       });
-    } else {
-      setState(() {
-        _fileBytes = file.bytes!;
-        _fileName  = file.name;
-      });
-    }
-
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Seleccionado: $_fileName')),
-      );
-    }
-  } catch (e) {
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error al seleccionar archivo: $e')),
-      );
     }
   }
-}
+
   Future<void> _encryptAndUpload() async {
-    if (_fileBytes == null || _bb84Key == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Selecciona archivo y genera la clave primero.')),
-      );
+    if (_fileBytes == null || _keyHex == null) {
+      _toast('Select a file and fetch BB84 key first.', isError: true);
       return;
     }
     setState(() => _busy = true);
     try {
-      final key = _crypto.deriveKey(_bb84Key!); // 16 bytes
-      final iv  = _crypto.randomIv();
-      final encData = _crypto.encryptBytes(_fileBytes!, key, iv);
-      final cipher = encData['cipher'] as Uint8List;
-      final ivB64  = encData['ivB64'] as String;
+      // hex → bytes
+      final keyBytes = Uint8List(_keyHex!.length ~/ 2);
+      for (var i = 0; i < _keyHex!.length; i += 2) {
+        keyBytes[i ~/ 2] = int.parse(_keyHex!.substring(i, i + 2), radix: 16);
+      }
 
-      final req = http.MultipartRequest('POST', Uri.parse('${widget.baseUrl}/upload'));
-      req.fields['iv_b64'] = ivB64;
-      req.files.add(http.MultipartFile.fromBytes(
-        'file',
-        cipher,
-        filename: '${_fileName ?? 'file'}.enc',
-      ));
+      final result = _crypto.encryptBytes(_fileBytes!, keyBytes, _crypto.randomIv());
+      final cipher = result['cipher'] as Uint8List;
+      final ivB64  = result['ivB64'] as String;
+
+      final req = http.MultipartRequest('POST', Uri.parse('$_baseUrl/upload'))
+        ..fields['iv_b64'] = ivB64
+        ..fields['key_hex'] = _keyHex!
+        ..files.add(http.MultipartFile.fromBytes('file', cipher, filename: '${_fileName ?? 'file'}.enc'));
 
       final resp = await req.send();
       if (resp.statusCode == 200) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Archivo cifrado enviado con éxito.')),
-          );
-        }
+        final body = await http.Response.fromStream(resp);
+        final data = jsonDecode(body.body) as Map<String, dynamic>;
+        final transferId = data['transfer_id'] as String;
+
+        if (!mounted) return;
+        await showDialog(
+          context: context,
+          builder: (_) => AlertDialog(
+            title: const Text('Transfer created'),
+            content: SelectableText('Transfer ID:\n$transferId'),
+            actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK'))],
+          ),
+        );
       } else {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Error al subir: ${resp.statusCode}')),
-          );
-        }
+        _toast('Upload error: ${resp.statusCode}', isError: true);
       }
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Fallo cifrado/subida: $e')),
-        );
-      }
+      _toast('Encrypt/Upload error: $e', isError: true);
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
 
+  void _toast(String msg, {bool isError = false}) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(msg),
+      backgroundColor: isError ? Colors.red.shade700 : null,
+      duration: const Duration(seconds: 2),
+    ));
+  }
+
   @override
   Widget build(BuildContext context) {
-    final canEncrypt = _fileBytes != null && _bb84Key != null;
+    final canEncrypt = _fileBytes != null && _keyHex != null;
+    final scheme = Theme.of(context).colorScheme;
+
     return Scaffold(
-      appBar: AppBar(title: const Text('quansfer')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
+      appBar: AppBar(
+        title: Row(
           children: [
-            FilledButton.icon(
-              onPressed: _busy ? null : _getKey,
-              icon: const Icon(Icons.key),
-              label: const Text('1) Obtener clave (BB84)'),
-            ),
-            const SizedBox(height: 12),
-            FilledButton.icon(
-              onPressed: _busy ? null : _pickFile,
-              icon: const Icon(Icons.attach_file),
-              label: const Text('2) Seleccionar archivo'),
-            ),
-            const SizedBox(height: 12),
-            FilledButton.icon(
-              onPressed: _busy || !canEncrypt ? null : _encryptAndUpload,
-              icon: const Icon(Icons.lock),
-              label: const Text('3) Cifrar (AES-CBC) y subir'),
-            ),
-            const SizedBox(height: 24),
-            if (_fileName != null) Text('Archivo: $_fileName'),
-            const SizedBox(height: 12),
-            if (_busy) const LinearProgressIndicator(),
-            ElevatedButton.icon(
-  onPressed: () {
-    Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => ReceiverPage(baseUrl: widget.baseUrl),
-    ));
-  },
-  icon: const Icon(Icons.download),
-  label: const Text('Ir a Receptor (Descifrar)'),
-),
+            Image.asset('assets/logo_quansfer.png', height: 28),
+            const SizedBox(width: 10),
+            const Text('Quansfer'),
           ],
-          
         ),
+        actions: [
+          IconButton(
+            tooltip: 'Receiver',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => ReceiverPage(appState: widget.appState)),
+            ),
+            icon: const Icon(Icons.swap_vert),
+          ),
+          IconButton(
+            tooltip: 'Settings',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => SettingsPage(appState: widget.appState)),
+            ),
+            icon: const Icon(Icons.settings),
+          ),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 10, 16, 24),
+        children: [
+          const SizedBox(height: 8),
+          const BrandLogo(size: 86, showWordmark: false),
+          const SizedBox(height: 18),
+
+          Text("Secure file exchange with BB84",
+              style: Theme.of(context).textTheme.titleMedium!.copyWith(fontWeight: FontWeight.w800)),
+          const SizedBox(height: 6),
+          Text("Generate a quantum-derived key, encrypt locally, and upload safely.",
+              style: Theme.of(context).textTheme.bodyMedium),
+
+          const SizedBox(height: 18),
+          InfoTile(
+            icon: Icons.key,
+            title: _keyHex == null ? 'No key yet' : 'BB84 key ready',
+            subtitle: _keyHex == null
+                ? 'Tap to fetch a fresh shared key from server.'
+                : 'A secure key is available for this session.',
+          ),
+          const SizedBox(height: 10),
+          InfoTile(
+            icon: Icons.insert_drive_file,
+            title: _fileName ?? 'No file selected',
+            subtitle: _fileName == null ? 'Pick any file to encrypt & upload.' : 'Ready to encrypt.',
+          ),
+
+          const SizedBox(height: 18),
+          PrimaryButton(
+            onPressed: _busy ? null : _getBB84Key,
+            icon: Icons.vpn_key,
+            label: '1) Fetch BB84 key',
+            loading: _busy && _keyHex == null,
+          ),
+          const SizedBox(height: 10),
+          PrimaryButton(
+            onPressed: _busy ? null : _pickFile,
+            icon: Icons.attach_file,
+            label: '2) Choose file',
+            loading: false,
+          ),
+          const SizedBox(height: 10),
+          PrimaryButton(
+            onPressed: _busy || !canEncrypt ? null : _encryptAndUpload,
+            icon: Icons.lock,
+            label: '3) Encrypt & upload',
+            loading: _busy && canEncrypt,
+          ),
+
+          const SizedBox(height: 24),
+          Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(16),
+              color: scheme.secondaryContainer.withOpacity(.35),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.info_outline),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    'Keep your Transfer ID safe. You will use it on Receiver to download or decrypt.',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
