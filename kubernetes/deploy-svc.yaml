@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  labels: { app: backend, env: dev }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: backend } }
+  template:
+    metadata: { labels: { app: backend, env: dev } }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 1001, fsGroup: 1001 }
+      containers:
+        - name: app
+          image: <tu-registry>/<tu-user>/quansfer-backend:1.0
+          ports: [ { containerPort: 8000 } ]
+          env: [ { name: UPLOAD_DIR, value: /data/uploads } ]
+          volumeMounts: [ { name: uploads, mountPath: /data/uploads } ]
+      volumes:
+        - name: uploads
+          persistentVolumeClaim: { claimName: uploads-pvc }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-svc
+  labels: { app: backend, env: dev }
+spec:
+  selector: { app: backend }
+  ports: [ { name: http, port: 80, targetPort: 8000 } ]
