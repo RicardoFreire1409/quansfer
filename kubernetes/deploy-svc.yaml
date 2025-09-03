@@ -4,15 +4,14 @@ metadata:
   name: backend
   labels: { app: backend, env: dev }
 spec:
-  replicas: 2
+  replicas: 1
   selector: { matchLabels: { app: backend } }
   template:
     metadata: { labels: { app: backend, env: dev } }
     spec:
-      securityContext: { runAsNonRoot: true, runAsUser: 1001, fsGroup: 1001 }
       containers:
         - name: app
-          image: <tu-registry>/<tu-user>/quansfer-backend:1.0
+          image: docker.io/jorftama/quansfer-backend:1.1
           ports: [ { containerPort: 8000 } ]
           env: [ { name: UPLOAD_DIR, value: /data/uploads } ]
           volumeMounts: [ { name: uploads, mountPath: /data/uploads } ]

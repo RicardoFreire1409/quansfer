@@ -14,7 +14,10 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-UPLOAD_DIR = Path("uploads")
+import os
+from pathlib import Path
+
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "/data/uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # Guardamos metadatos: transfer_id -> {

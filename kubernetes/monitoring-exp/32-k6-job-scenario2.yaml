@@ -1,0 +1,30 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-scenario2
+  namespace: rfreire1409-dev
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: k6
+          image: grafana/k6:0.49.0
+          command: ["k6","run","/scripts/test.js"]
+          env:
+            - name: VUS
+              value: "60"
+            - name: DURATION
+              value: "2m"
+            - name: BASE_URL
+              value: "http://backend.rfreire1409-dev.svc.cluster.local:8000"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: k6-script
+            items:
+              - key: test.js
+                path: test.js
